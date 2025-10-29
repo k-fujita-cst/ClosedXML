@@ -57,7 +57,7 @@ internal class WorksheetPartReader
                             ws.RowHeight = sheetFormatProperties.DefaultRowHeight;
 
                         ws.RowHeightChanged = (sheetFormatProperties.CustomHeight != null &&
-                                               sheetFormatProperties.CustomHeight.Value);
+                                                sheetFormatProperties.CustomHeight.Value);
 
                         if (sheetFormatProperties.DefaultColumnWidth != null)
                             ws.ColumnWidth = XLHelper.ConvertWidthToNoC(sheetFormatProperties.DefaultColumnWidth.Value, ws.Style.Font, ws.Workbook);
@@ -615,11 +615,71 @@ internal class WorksheetPartReader
         }
 
         // Load phonetic runs
-        var phoneticRuns = element.Elements<PhoneticRun>();
-        foreach (PhoneticRun pr in phoneticRuns)
+        try
         {
-            xlCell.GetRichText().Phonetics.Add(pr.Text.InnerText.FixNewLines(), (Int32)pr.BaseTextStartIndex.Value,
-                                          (Int32)pr.EndingBaseIndex.Value);
+            // 基本文字列を取得（element.Text があればそれを、なければ Run の Text を連結）
+            var baseText = element.Text?.InnerText ?? string.Concat(element.Elements<Run>().Select(r => r.Text?.InnerText ?? string.Empty));
+            var baseLen = baseText?.Length ?? 0;
+
+            // PhoneticRun を収集して開始位置でソートする
+            var phoneticRuns = element.Elements<PhoneticRun>()
+                .Select(pr => new
+                {
+                    Text = pr.Text?.InnerText?.FixNewLines() ?? string.Empty,
+                    StartNullable = pr.BaseTextStartIndex?.Value,
+                    EndNullable = pr.EndingBaseIndex?.Value
+                })
+                .Where(x => x.StartNullable.HasValue && x.EndNullable.HasValue)
+                .Select(x => new { x.Text, Start = (int)x.StartNullable.Value, EndInclusive = (int)x.EndNullable.Value })
+                .OrderBy(x => x.Start)
+                .ToList();
+
+            int lastEndExclusive = 0; // 前のランの排他的終端（初期は 0 でよい）
+            foreach (var pr in phoneticRuns)
+            {
+                // 範囲チェックと補正（End は OpenXML では inclusive）
+                var start = Math.Max(pr.Start, 0);
+                var endInclusive = pr.EndInclusive;
+
+                // base 長を超える場合は切り詰め
+                if (baseLen > 0 && endInclusive >= baseLen)
+                {
+                    Debug.WriteLine($"Phonetic run end out of range, truncating. start={start}, endInclusive={endInclusive}, baseLen={baseLen}");
+                    endInclusive = baseLen - 1;
+                }
+
+                // 無効なラン（end < start）はスキップ
+                if (endInclusive < start)
+                {
+                    Debug.WriteLine($"Skipping invalid phonetic run (endInclusive < start): start={start}, endInclusive={endInclusive}");
+                    continue;
+                }
+
+                // 排他的 end に変換
+                var endExclusive = endInclusive + 1;
+
+                // 昇順・非重複を保証（開始が直前の排他的終端より小さいとオーバーラップ）
+                if (start < lastEndExclusive)
+                {
+                    Debug.WriteLine($"Skipping overlapping/unsorted phonetic run: start={start}, endExclusive={endExclusive}, lastEndExclusive={lastEndExclusive}");
+                    continue;
+                }
+
+                try
+                {
+                    // ClosedXML は end を排他的に期待しているので endExclusive を渡す
+                    xlCell.GetRichText().Phonetics.Add(pr.Text, start, endExclusive);
+                    lastEndExclusive = endExclusive;
+                }
+                catch (Exception exAdd)
+                {
+                    Debug.WriteLine($"Failed to add phonetic run for cell {xlCell.Address}: start={start}, endExclusive={endExclusive}, text='{pr.Text}'. Exception: {exAdd}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine(ex.ToString());
         }
     }
 
